@@ -21,10 +21,8 @@ const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // S3 image upload config
 const upload = multer({
   storage: multerS3({
-    s3,
-    bucket: process.env.S3_BUCKET,
-    acl: 'public-read',
-    key: (req, file, cb) => cb(null, `apartments/${uuidv4()}-${file.originalname}`)
+    s3, bucket: process.env.S3_BUCKET,
+    key: (req, file, cb) => cb(null, `vacansee/${uuidv4()}-${file.originalname}`)
   })
 });
 
@@ -145,7 +143,7 @@ app.post('/api/ai/recommend', async (req, res) => {
       ).join('\n');
 
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 1000,
       messages: [{
         role: 'user',
@@ -188,7 +186,7 @@ app.post('/api/ai/chat', async (req, res) => {
       ).join('\n');
 
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: 500,
       system: `You are VacanSee AI, a helpful housing assistant for FUTA (Federal University of Technology Akure) students in Nigeria.
 
