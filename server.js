@@ -47,6 +47,15 @@ const upload = multer({
 });
 
 /* =========================
+   Helper: safe number parse
+   Returns 0 if value is missing, empty, or NaN
+========================= */
+const safeNum = (val, fallback = 0) => {
+  const n = Number(val);
+  return isNaN(n) ? fallback : n;
+};
+
+/* =========================
    ROUTE 1: Health check
 ========================= */
 
@@ -81,13 +90,29 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
       email
     } = req.body;
 
-    const imageUrls = req.files.map(f => f.location);
+    // Guard: make sure required numeric fields are present
+    if (!monthlyRent || isNaN(Number(monthlyRent))) {
+      return res.status(400).json({ error: 'monthlyRent is required and must be a valid number.' });
+    }
+    if (!bedrooms || isNaN(Number(bedrooms))) {
+      return res.status(400).json({ error: 'bedrooms is required and must be a valid number.' });
+    }
+    if (!bathrooms || isNaN(Number(bathrooms))) {
+      return res.status(400).json({ error: 'bathrooms is required and must be a valid number.' });
+    }
+
+    const imageUrls = (req.files || []).map(f => f.location);
+
+    const parsedMonthlyRent = safeNum(monthlyRent);
+    const parsedCautionFee  = safeNum(cautionFee);
+    const parsedAgencyFee   = safeNum(agencyFee);
+    const parsedAgreementFee = safeNum(agreementFee);
 
     const totalPackage =
-      Number(monthlyRent) +
-      Number(cautionFee || 0) +
-      Number(agencyFee || 0) +
-      Number(agreementFee || 0);
+      parsedMonthlyRent +
+      parsedCautionFee +
+      parsedAgencyFee +
+      parsedAgreementFee;
 
     const apartment = {
       apartmentId: uuidv4(),
@@ -95,21 +120,21 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
       location,
       zone: zone || 'Akure',
       description,
-      bedrooms: Number(bedrooms),
-      bathrooms: Number(bathrooms),
-      amenities: amenities ? amenities.split(',') : [],
+      bedrooms:  safeNum(bedrooms),
+      bathrooms: safeNum(bathrooms),
+      amenities: amenities ? amenities.split(',').map(a => a.trim()) : [],
 
-      monthlyRent: Number(monthlyRent),
-      cautionFee: Number(cautionFee || 0),
-      agencyFee: Number(agencyFee || 0),
-      agreementFee: Number(agreementFee || 0),
+      monthlyRent:  parsedMonthlyRent,
+      cautionFee:   parsedCautionFee,
+      agencyFee:    parsedAgencyFee,
+      agreementFee: parsedAgreementFee,
 
       totalPackage,
 
       landlordName: landlordName || 'Landlord',
       whatsapp: whatsapp || '',
-      phone: phone || '',
-      email: email || '',
+      phone:    phone    || '',
+      email:    email    || '',
 
       imageUrls,
       available: true,
@@ -125,7 +150,7 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
 
     res.json({ success: true, apartment });
   } catch (err) {
-    console.error(err);
+    console.error('Upload error:', err);
     res.status(500).json({ error: err.message });
   }
 });
