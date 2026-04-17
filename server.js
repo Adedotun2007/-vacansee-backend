@@ -267,7 +267,7 @@ app.post('/api/ai/recommend', async (req, res) => {
       .join('\n');
 
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-4-5-20251001',
       max_tokens: 1000,
       messages: [
         {
@@ -315,7 +315,7 @@ app.post('/api/ai/chat', async (req, res) => {
       .join('\n');
 
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-4-5-20251001',
       max_tokens: 500,
       system: `You are VacanSee AI...
 
