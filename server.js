@@ -37,18 +37,18 @@ const claude = new Anthropic({
    S3 upload config
 ========================= */
 
-const upload = multer({
+const uploadMiddleware = multer({
   storage: multerS3({
     s3,
     bucket: process.env.S3_BUCKET,
     key: (req, file, cb) =>
       cb(null, `vacansee/${uuidv4()}-${file.originalname}`)
   })
-});
+}).array('photos', 10);
 
 /* =========================
    Helper: safe number parse
-   Returns 0 if value is missing, empty, or NaN
+   Returns fallback (default 0) if value is missing, empty, or NaN
 ========================= */
 const safeNum = (val, fallback = 0) => {
   const n = Number(val);
@@ -68,9 +68,29 @@ app.get('/', (req, res) => {
 
 /* =========================
    ROUTE 2: Upload apartment
+   Accepts both JSON and multipart/form-data
 ========================= */
 
-app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
+app.post('/api/apartments', (req, res) => {
+  const contentType = req.headers['content-type'] || '';
+
+  if (contentType.includes('multipart/form-data')) {
+    // FormData with files — run multer first
+    uploadMiddleware(req, res, (err) => {
+      if (err) {
+        console.error('Multer error:', err);
+        return res.status(500).json({ error: 'File upload failed: ' + err.message });
+      }
+      handleApartmentSave(req, res);
+    });
+  } else {
+    // Plain JSON — no files
+    req.files = [];
+    handleApartmentSave(req, res);
+  }
+});
+
+async function handleApartmentSave(req, res) {
   try {
     const {
       title,
@@ -90,51 +110,60 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
       email
     } = req.body;
 
-    // Guard: make sure required numeric fields are present
-    if (!monthlyRent || isNaN(Number(monthlyRent))) {
+    // Log body to help debug future issues
+    console.log('Incoming apartment body:', JSON.stringify(req.body));
+
+    // Validate required fields
+    if (!title)    return res.status(400).json({ error: 'title is required.' });
+    if (!location) return res.status(400).json({ error: 'location is required.' });
+    if (!monthlyRent || isNaN(Number(monthlyRent)))
       return res.status(400).json({ error: 'monthlyRent is required and must be a valid number.' });
-    }
-    if (!bedrooms || isNaN(Number(bedrooms))) {
+    if (!bedrooms || isNaN(Number(bedrooms)))
       return res.status(400).json({ error: 'bedrooms is required and must be a valid number.' });
-    }
-    if (!bathrooms || isNaN(Number(bathrooms))) {
+    if (!bathrooms || isNaN(Number(bathrooms)))
       return res.status(400).json({ error: 'bathrooms is required and must be a valid number.' });
-    }
 
     const imageUrls = (req.files || []).map(f => f.location);
 
-    const parsedMonthlyRent = safeNum(monthlyRent);
-    const parsedCautionFee  = safeNum(cautionFee);
-    const parsedAgencyFee   = safeNum(agencyFee);
+    const parsedMonthlyRent  = safeNum(monthlyRent);
+    const parsedCautionFee   = safeNum(cautionFee);
+    const parsedAgencyFee    = safeNum(agencyFee);
     const parsedAgreementFee = safeNum(agreementFee);
 
     const totalPackage =
       parsedMonthlyRent +
-      parsedCautionFee +
-      parsedAgencyFee +
+      parsedCautionFee  +
+      parsedAgencyFee   +
       parsedAgreementFee;
 
+    // Handle amenities — string from FormData or array from JSON
+    let amenitiesList = [];
+    if (Array.isArray(amenities)) {
+      amenitiesList = amenities;
+    } else if (typeof amenities === 'string' && amenities.trim()) {
+      amenitiesList = amenities.split(',').map(a => a.trim());
+    }
+
     const apartment = {
-      apartmentId: uuidv4(),
+      apartmentId:  uuidv4(),
       title,
       location,
-      zone: zone || 'Akure',
-      description,
-      bedrooms:  safeNum(bedrooms),
-      bathrooms: safeNum(bathrooms),
-      amenities: amenities ? amenities.split(',').map(a => a.trim()) : [],
+      zone:         zone        || 'Akure',
+      description:  description || '',
+      bedrooms:     safeNum(bedrooms),
+      bathrooms:    safeNum(bathrooms),
+      amenities:    amenitiesList,
 
       monthlyRent:  parsedMonthlyRent,
       cautionFee:   parsedCautionFee,
       agencyFee:    parsedAgencyFee,
       agreementFee: parsedAgreementFee,
-
       totalPackage,
 
       landlordName: landlordName || 'Landlord',
-      whatsapp: whatsapp || '',
-      phone:    phone    || '',
-      email:    email    || '',
+      whatsapp:     whatsapp    || '',
+      phone:        phone       || '',
+      email:        email       || '',
 
       imageUrls,
       available: true,
@@ -150,10 +179,10 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
 
     res.json({ success: true, apartment });
   } catch (err) {
-    console.error('Upload error:', err);
+    console.error('Save error:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
 
 /* =========================
    ROUTE 3: Get all apartments
@@ -207,9 +236,7 @@ app.patch('/api/apartments/:id/availability', async (req, res) => {
         TableName: 'Apartments',
         Key: { apartmentId: req.params.id },
         UpdateExpression: 'set available = :a',
-        ExpressionAttributeValues: {
-          ':a': available
-        }
+        ExpressionAttributeValues: { ':a': available }
       })
     );
 
