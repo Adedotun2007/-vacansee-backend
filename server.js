@@ -5,7 +5,13 @@ const multer = require('multer');
 const multerS3 = require('multer-s3');
 const { S3Client } = require('@aws-sdk/client-s3');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, PutCommand, ScanCommand, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const {
+  DynamoDBDocumentClient,
+  PutCommand,
+  ScanCommand,
+  GetCommand,
+  UpdateCommand
+} = require('@aws-sdk/lib-dynamodb');
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -13,52 +19,75 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ SAFE NUMBER CONVERTER (ADDED)
-const toNumber = (value) => {
-  if (value === undefined || value === null || value === "") return 0;
-  const cleaned = String(value).replace(/,/g, '');
-  const num = Number(cleaned);
-  return isNaN(num) ? 0 : num;
-};
+/* =========================
+   AWS + Claude setup
+========================= */
 
-// AWS + Claude setup
 const s3 = new S3Client({ region: process.env.AWS_REGION });
-const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION }));
-const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// S3 image upload config
+const dynamo = DynamoDBDocumentClient.from(
+  new DynamoDBClient({ region: process.env.AWS_REGION })
+);
+
+const claude = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY
+});
+
+/* =========================
+   S3 upload config
+========================= */
+
 const upload = multer({
   storage: multerS3({
     s3,
     bucket: process.env.S3_BUCKET,
-    key: (req, file, cb) => cb(null, `vacansee/${uuidv4()}-${file.originalname}`)
+    key: (req, file, cb) =>
+      cb(null, `vacansee/${uuidv4()}-${file.originalname}`)
   })
 });
 
-// ROUTE 1: Health check
+/* =========================
+   ROUTE 1: Health check
+========================= */
+
 app.get('/', (req, res) => {
-  res.json({ status: 'VacanSee API is running!', app: 'VacanSee - FUTA Student Housing' });
+  res.json({
+    status: 'VacanSee API is running!',
+    app: 'VacanSee - FUTA Student Housing'
+  });
 });
 
-// ROUTE 2: Upload new apartment listing (landlord)
+/* =========================
+   ROUTE 2: Upload apartment
+========================= */
+
 app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
   try {
     const {
-      title, location, zone, description,
-      bedrooms, bathrooms, amenities,
-      monthlyRent, cautionFee, agencyFee, agreementFee,
-      landlordName, whatsapp, phone, email
+      title,
+      location,
+      zone,
+      description,
+      bedrooms,
+      bathrooms,
+      amenities,
+      monthlyRent,
+      cautionFee,
+      agencyFee,
+      agreementFee,
+      landlordName,
+      whatsapp,
+      phone,
+      email
     } = req.body;
 
-    // ✅ SAFE IMAGE HANDLING (FIXED)
-    const imageUrls = req.files?.map(f => f.location) || [];
+    const imageUrls = req.files.map(f => f.location);
 
-    // ✅ SAFE NUMBER CALCULATION (FIXED)
     const totalPackage =
-      toNumber(monthlyRent) +
-      toNumber(cautionFee) +
-      toNumber(agencyFee) +
-      toNumber(agreementFee);
+      Number(monthlyRent) +
+      Number(cautionFee || 0) +
+      Number(agencyFee || 0) +
+      Number(agreementFee || 0);
 
     const apartment = {
       apartmentId: uuidv4(),
@@ -66,17 +95,14 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
       location,
       zone: zone || 'Akure',
       description,
-
-      // ✅ ALL NUMBERS FIXED
-      bedrooms: toNumber(bedrooms),
-      bathrooms: toNumber(bathrooms),
-
+      bedrooms: Number(bedrooms),
+      bathrooms: Number(bathrooms),
       amenities: amenities ? amenities.split(',') : [],
 
-      monthlyRent: toNumber(monthlyRent),
-      cautionFee: toNumber(cautionFee),
-      agencyFee: toNumber(agencyFee),
-      agreementFee: toNumber(agreementFee),
+      monthlyRent: Number(monthlyRent),
+      cautionFee: Number(cautionFee || 0),
+      agencyFee: Number(agencyFee || 0),
+      agreementFee: Number(agreementFee || 0),
 
       totalPackage,
 
@@ -90,15 +116,179 @@ app.post('/api/apartments', upload.array('photos', 10), async (req, res) => {
       createdAt: new Date().toISOString()
     };
 
-    await dynamo.send(new PutCommand({
-      TableName: 'Apartments',
-      Item: apartment
-    }));
+    await dynamo.send(
+      new PutCommand({
+        TableName: 'Apartments',
+        Item: apartment
+      })
+    );
 
     res.json({ success: true, apartment });
-
   } catch (err) {
-    console.error("UPLOAD ERROR:", err); // ✅ clearer log
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
+});
+
+/* =========================
+   ROUTE 3: Get all apartments
+========================= */
+
+app.get('/api/apartments', async (req, res) => {
+  try {
+    const result = await dynamo.send(
+      new ScanCommand({ TableName: 'Apartments' })
+    );
+
+    const sorted = (result.Items || []).sort(
+      (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+    );
+
+    res.json({ apartments: sorted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   ROUTE 4: Get apartment by ID
+========================= */
+
+app.get('/api/apartments/:id', async (req, res) => {
+  try {
+    const result = await dynamo.send(
+      new GetCommand({
+        TableName: 'Apartments',
+        Key: { apartmentId: req.params.id }
+      })
+    );
+
+    res.json({ apartment: result.Item });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   ROUTE 5: Availability
+========================= */
+
+app.patch('/api/apartments/:id/availability', async (req, res) => {
+  try {
+    const { available } = req.body;
+
+    await dynamo.send(
+      new UpdateCommand({
+        TableName: 'Apartments',
+        Key: { apartmentId: req.params.id },
+        UpdateExpression: 'set available = :a',
+        ExpressionAttributeValues: {
+          ':a': available
+        }
+      })
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   ROUTE 6: AI Recommend
+========================= */
+
+app.post('/api/ai/recommend', async (req, res) => {
+  try {
+    const { budget, zone, bedrooms, preferences } = req.body;
+
+    const listings = await dynamo.send(
+      new ScanCommand({ TableName: 'Apartments' })
+    );
+
+    const listingText = listings.Items
+      .filter(a => a.available)
+      .map(
+        a =>
+          `ID: ${a.apartmentId} | ${a.title} | ${a.location} (${a.zone}) | Monthly: ₦${a.monthlyRent.toLocaleString()} | Total Package: ₦${a.totalPackage.toLocaleString()} | ${a.bedrooms} bed | Amenities: ${a.amenities?.join(', ')}`
+      )
+      .join('\n');
+
+    const msg = await claude.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1000,
+      messages: [
+        {
+          role: 'user',
+          content: `You are VacanSee AI...
+
+Student preferences:
+- Budget: ₦${budget}
+- Zone: ${zone || 'anywhere near FUTA'}
+- Bedrooms: ${bedrooms}
+- Preferences: ${preferences || 'none'}
+
+Listings:
+${listingText}
+
+Recommend top 3...`
+        }
+      ]
+    });
+
+    res.json({ recommendation: msg.content[0].text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   ROUTE 7: AI Chat
+========================= */
+
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body;
+
+    const listings = await dynamo.send(
+      new ScanCommand({ TableName: 'Apartments' })
+    );
+
+    const listingText = listings.Items
+      .filter(a => a.available)
+      .map(
+        a =>
+          `${a.title} at ${a.location} — ₦${a.monthlyRent?.toLocaleString()}/month, total package ₦${a.totalPackage?.toLocaleString()}, ${a.bedrooms} bed, WhatsApp: ${a.whatsapp}`
+      )
+      .join('\n');
+
+    const msg = await claude.messages.create({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 500,
+      system: `You are VacanSee AI...
+
+Listings:
+${listingText}
+`,
+      messages: [
+        ...(history || []),
+        { role: 'user', content: message }
+      ]
+    });
+
+    res.json({ reply: msg.content[0].text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   START SERVER
+========================= */
+
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`✅ VacanSee API running on http://localhost:${PORT}`);
+  console.log(`App: FUTA Student Housing Platform`);
 });
