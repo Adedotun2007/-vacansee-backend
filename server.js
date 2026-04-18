@@ -79,7 +79,6 @@ app.get('/', (req, res) => {
    ADMIN ROUTES
 ========================= */
 
-// Admin login
 app.post('/api/admin/login', (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD) {
@@ -89,7 +88,6 @@ app.post('/api/admin/login', (req, res) => {
   }
 });
 
-// Generate a new landlord PIN
 app.post('/api/admin/generate-pin', async (req, res) => {
   const { email, password } = req.body;
   if (email !== process.env.ADMIN_EMAIL || password !== process.env.ADMIN_PASSWORD)
@@ -107,7 +105,6 @@ app.post('/api/admin/generate-pin', async (req, res) => {
   }
 });
 
-// List all generated PINs
 app.post('/api/admin/list-pins', async (req, res) => {
   const { email, password } = req.body;
   if (email !== process.env.ADMIN_EMAIL || password !== process.env.ADMIN_PASSWORD)
@@ -121,7 +118,6 @@ app.post('/api/admin/list-pins', async (req, res) => {
   }
 });
 
-// Validate a PIN (called during landlord signup)
 app.post('/api/validate-pin', async (req, res) => {
   const { pin } = req.body;
   try {
@@ -136,14 +132,33 @@ app.post('/api/validate-pin', async (req, res) => {
 });
 
 /* =========================
+   USERNAME CHECK
+========================= */
+
+app.get('/api/check-username', async (req, res) => {
+  const { username } = req.query;
+  if (!username) return res.status(400).json({ error: 'Username required' });
+  try {
+    const result = await dynamo.send(new ScanCommand({
+      TableName: 'LandlordProfiles',
+      FilterExpression: 'username = :u',
+      ExpressionAttributeValues: { ':u': username.toLowerCase().trim() }
+    }));
+    res.json({ available: !result.Items || result.Items.length === 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
    LANDLORD AUTH ROUTES
 ========================= */
 
-// Landlord signup (requires valid PIN)
+// Landlord signup (requires valid PIN + unique username)
 app.post('/api/landlord/signup', (req, res) => {
   uploadSingle(req, res, async (err) => {
     if (err) return res.status(500).json({ error: 'Photo upload failed: ' + err.message });
-    const { name, email, password, phone, whatsapp, bio, pin } = req.body;
+    const { name, email, password, phone, whatsapp, bio, pin, username } = req.body;
     try {
       // Validate PIN
       const pinRecord = await dynamo.send(new GetCommand({ TableName: 'AdminPins', Key: { pin } }));
@@ -159,6 +174,17 @@ app.post('/api/landlord/signup', (req, res) => {
       if (existing.Items && existing.Items.length > 0)
         return res.status(400).json({ error: 'An account with this email already exists' });
 
+      // Check username not already taken
+      if (username) {
+        const usernameCheck = await dynamo.send(new ScanCommand({
+          TableName: 'LandlordProfiles',
+          FilterExpression: 'username = :u',
+          ExpressionAttributeValues: { ':u': username.toLowerCase().trim() }
+        }));
+        if (usernameCheck.Items && usernameCheck.Items.length > 0)
+          return res.status(400).json({ error: 'This username is already taken. Please choose another.' });
+      }
+
       const landlordId = uuidv4();
       const profilePhotoUrl = req.file ? req.file.location : '';
 
@@ -166,6 +192,7 @@ app.post('/api/landlord/signup', (req, res) => {
         TableName: 'LandlordProfiles',
         Item: {
           landlordId, name, email,
+          username: username ? username.toLowerCase().trim() : '',
           passwordHash: hashPassword(password),
           phone: phone || '', whatsapp: whatsapp || '',
           bio: bio || '', profilePhotoUrl,
@@ -184,7 +211,7 @@ app.post('/api/landlord/signup', (req, res) => {
         ExpressionAttributeValues: { ':u': true, ':e': email, ':t': new Date().toISOString() }
       }));
 
-      res.json({ success: true, landlordId, name, email });
+      res.json({ success: true, landlordId, name, email, username: username ? username.toLowerCase().trim() : '' });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -203,7 +230,7 @@ app.post('/api/landlord/login', async (req, res) => {
     if (!result.Items || result.Items.length === 0)
       return res.status(401).json({ error: 'Invalid email or password' });
     const l = result.Items[0];
-    res.json({ success: true, landlordId: l.landlordId, name: l.name, email: l.email });
+    res.json({ success: true, landlordId: l.landlordId, name: l.name, email: l.email, username: l.username || '' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -222,7 +249,6 @@ app.get('/api/landlord/:id', async (req, res) => {
       FilterExpression: 'landlordId = :id',
       ExpressionAttributeValues: { ':id': req.params.id }
     }));
-    // Strip landlordSecret from each listing
     const safeListings = (listings.Items || []).map(({ landlordSecret, ...rest }) => rest);
     res.json({ landlord: publicProfile, listings: safeListings });
   } catch (err) {
@@ -298,7 +324,6 @@ app.post('/api/tenant/login', async (req, res) => {
    APARTMENT ROUTES
 ========================= */
 
-// Upload apartment — accepts both JSON and multipart/form-data
 app.post('/api/apartments', (req, res) => {
   const contentType = req.headers['content-type'] || '';
   if (contentType.includes('multipart/form-data')) {
@@ -322,7 +347,6 @@ async function handleApartmentSave(req, res) {
       landlordId, landlordSecret
     } = req.body;
 
-    // Accept yearlyRent or monthlyRent (Lovable may send either)
     const rentValue = yearlyRent || monthlyRent;
 
     console.log('Incoming apartment body:', JSON.stringify(req.body));
@@ -336,8 +360,22 @@ async function handleApartmentSave(req, res) {
     if (!bathrooms || isNaN(Number(bathrooms)))
       return res.status(400).json({ error: 'bathrooms is required and must be a number.' });
 
-    const imageUrls = (req.files || []).map(f => f.location);
+    // If landlordId provided, fetch their username to use as landlordName
+    let resolvedLandlordName = landlordName || 'Landlord';
+    if (landlordId) {
+      try {
+        const landlordRecord = await dynamo.send(new GetCommand({
+          TableName: 'LandlordProfiles', Key: { landlordId }
+        }));
+        if (landlordRecord.Item) {
+          resolvedLandlordName = landlordRecord.Item.username || landlordRecord.Item.name || resolvedLandlordName;
+        }
+      } catch (e) {
+        // fallback to provided name if lookup fails
+      }
+    }
 
+    const imageUrls = (req.files || []).map(f => f.location);
     const parsedYearlyRent   = safeNum(rentValue);
     const parsedCautionFee   = safeNum(cautionFee);
     const parsedAgencyFee    = safeNum(agencyFee);
@@ -352,8 +390,8 @@ async function handleApartmentSave(req, res) {
     const apartment = {
       apartmentId:    uuidv4(),
       title, location,
-      zone:           zone           || 'Akure',
-      description:    description    || '',
+      zone:           zone        || 'Akure',
+      description:    description || '',
       bedrooms:       safeNum(bedrooms),
       bathrooms:      safeNum(bathrooms),
       amenities:      amenitiesList,
@@ -362,11 +400,11 @@ async function handleApartmentSave(req, res) {
       agencyFee:      parsedAgencyFee,
       agreementFee:   parsedAgreementFee,
       totalPackage,
-      landlordName:   landlordName   || 'Landlord',
-      whatsapp:       whatsapp       || '',
-      phone:          phone          || '',
-      email:          email          || '',
-      landlordId:     landlordId     || '',   // ← links listing to landlord account
+      landlordName:   resolvedLandlordName,
+      whatsapp:       whatsapp    || '',
+      phone:          phone       || '',
+      email:          email       || '',
+      landlordId:     landlordId  || '',
       landlordSecret: landlordSecret || '',
       imageUrls,
       available:      true,
@@ -410,7 +448,7 @@ app.get('/api/apartments/:id', async (req, res) => {
   }
 });
 
-// Toggle availability
+// Toggle availability (uses landlord login password as secret)
 app.patch('/api/apartments/:id/availability', async (req, res) => {
   try {
     const { available, landlordSecret } = req.body;
@@ -419,7 +457,7 @@ app.patch('/api/apartments/:id/availability', async (req, res) => {
     );
     if (!result.Item) return res.status(404).json({ error: 'Apartment not found.' });
     if (result.Item.landlordSecret && result.Item.landlordSecret !== landlordSecret)
-      return res.status(403).json({ error: 'Invalid secret code. Access denied.' });
+      return res.status(403).json({ error: 'Invalid password. Access denied.' });
     await dynamo.send(new UpdateCommand({
       TableName: 'Apartments',
       Key: { apartmentId: req.params.id },
@@ -432,7 +470,7 @@ app.patch('/api/apartments/:id/availability', async (req, res) => {
   }
 });
 
-// Delete listing
+// Delete listing (uses landlord login password as secret)
 app.delete('/api/apartments/:id', async (req, res) => {
   try {
     const { landlordSecret } = req.body;
@@ -441,11 +479,48 @@ app.delete('/api/apartments/:id', async (req, res) => {
     );
     if (!result.Item) return res.status(404).json({ error: 'Apartment not found.' });
     if (result.Item.landlordSecret && result.Item.landlordSecret !== landlordSecret)
-      return res.status(403).json({ error: 'Invalid secret code. Access denied.' });
+      return res.status(403).json({ error: 'Invalid password. Access denied.' });
     await dynamo.send(
       new DeleteCommand({ TableName: 'Apartments', Key: { apartmentId: req.params.id } })
     );
     res.json({ success: true, message: 'Listing deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Edit listing (landlord must own it)
+app.patch('/api/apartments/:id/edit', async (req, res) => {
+  try {
+    const { landlordId, ...fields } = req.body;
+    const result = await dynamo.send(new GetCommand({
+      TableName: 'Apartments', Key: { apartmentId: req.params.id }
+    }));
+    if (!result.Item) return res.status(404).json({ error: 'Apartment not found' });
+    if (result.Item.landlordId !== landlordId)
+      return res.status(403).json({ error: 'You do not own this listing' });
+
+    const rentValue = fields.yearlyRent || fields.monthlyRent;
+    const parsedRent = safeNum(rentValue) || result.Item.yearlyRent;
+    const totalPackage = parsedRent + safeNum(fields.cautionFee) + safeNum(fields.agencyFee) + safeNum(fields.agreementFee);
+
+    await dynamo.send(new UpdateCommand({
+      TableName: 'Apartments',
+      Key: { apartmentId: req.params.id },
+      UpdateExpression: 'set title = :t, #loc = :l, description = :d, yearlyRent = :r, totalPackage = :tp, bedrooms = :b, bathrooms = :ba, amenities = :am',
+      ExpressionAttributeNames: { '#loc': 'location' },
+      ExpressionAttributeValues: {
+        ':t':  fields.title       || result.Item.title,
+        ':l':  fields.location    || result.Item.location,
+        ':d':  fields.description || result.Item.description,
+        ':r':  parsedRent,
+        ':tp': totalPackage,
+        ':b':  safeNum(fields.bedrooms)  || result.Item.bedrooms,
+        ':ba': safeNum(fields.bathrooms) || result.Item.bathrooms,
+        ':am': Array.isArray(fields.amenities) ? fields.amenities : result.Item.amenities
+      }
+    }));
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -472,7 +547,6 @@ app.post('/api/reviews', async (req, res) => {
       Item: { reviewId, apartmentId, tenantId, tenantName, rating: Number(rating), comment, createdAt: new Date().toISOString() }
     }));
 
-    // Recalculate average rating
     const allReviews = await dynamo.send(new ScanCommand({
       TableName: 'Reviews',
       FilterExpression: 'apartmentId = :a',
