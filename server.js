@@ -353,8 +353,8 @@ async function handleApartmentSave(req, res) {
 
     if (!title)    return res.status(400).json({ error: 'title is required.' });
     if (!location) return res.status(400).json({ error: 'location is required.' });
-    if (!rentValue || isNaN(Number(rentValue)))
-      return res.status(400).json({ error: 'Rent is required and must be a valid number.' });
+   if (!rentValue || isNaN(Number(rentValue)) || Number(rentValue) <= 0)
+      return res.status(400).json({ error: 'Annual rent must be greater than zero.' });
     if (!bedrooms || isNaN(Number(bedrooms)))
       return res.status(400).json({ error: 'bedrooms is required and must be a number.' });
     if (!bathrooms || isNaN(Number(bathrooms)))
