@@ -16,6 +16,7 @@ const {
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(cors());
@@ -26,6 +27,15 @@ const dynamo = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION })
 );
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Gmail transporter for OTP emails
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD
+  }
+});
 
 /* =========================
    S3 upload middleware
@@ -72,7 +82,7 @@ function hashPassword(password) {
    ROUTE 1: Health check
 ========================= */
 app.get('/', (req, res) => {
-  res.json({ status: 'VacanSee V2 API running!', version: '2.0', app: 'VacanSee - FUTA Student Housing' });
+  res.json({ status: 'VacanSee V3 API running!', version: '3.0', app: 'VacanSee - FUTA Community Housing' });
 });
 
 /* =========================
@@ -126,6 +136,100 @@ app.post('/api/validate-pin', async (req, res) => {
     if (result.Item.used) return res.json({ valid: false, reason: 'PIN already used' });
     if (new Date(result.Item.expiresAt) < new Date()) return res.json({ valid: false, reason: 'PIN expired' });
     res.json({ valid: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =========================
+   OTP ROUTES
+========================= */
+
+// Send OTP — for signup verification AND password reset
+app.post('/api/auth/send-otp', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  try {
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 mins
+    await dynamo.send(new PutCommand({
+      TableName: 'OTPCodes',
+      Item: { email, otp, expiresAt, used: false, createdAt: new Date().toISOString() }
+    }));
+    await transporter.sendMail({
+      from: `"VacanSee" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: 'VacanSee — Your Verification Code',
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px">
+          <h2 style="color:#1a5c35;margin-bottom:8px">VacanSee Verification</h2>
+          <p style="color:#555;margin-bottom:20px">Your verification code — expires in 10 minutes:</p>
+          <div style="background:#fff;border-radius:12px;padding:24px;text-align:center;border:2px solid #2d9e5f;margin-bottom:20px">
+            <p style="font-size:40px;font-weight:900;letter-spacing:12px;color:#1a5c35;margin:0">${otp}</p>
+          </div>
+          <p style="color:#888;font-size:12px">If you didn't request this, ignore this email.</p>
+          <p style="color:#888;font-size:12px">— VacanSee · vacansee@gmail.com</p>
+        </div>
+      `
+    });
+    res.json({ success: true, message: 'OTP sent!' });
+  } catch (err) {
+    console.error('OTP send error:', err);
+    res.status(500).json({ error: 'Failed to send OTP. Check Gmail credentials in Railway Variables.' });
+  }
+});
+
+// Verify OTP and reset password
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  if (!email || !otp || !newPassword)
+    return res.status(400).json({ error: 'Email, OTP and new password are required' });
+  if (newPassword.length < 6)
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  try {
+    const record = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
+    if (!record.Item) return res.status(400).json({ error: 'No OTP found. Request a new one.' });
+    if (record.Item.used) return res.status(400).json({ error: 'OTP already used. Request a new one.' });
+    if (new Date(record.Item.expiresAt) < new Date()) return res.status(400).json({ error: 'OTP expired. Request a new one.' });
+    if (record.Item.otp !== otp) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
+
+    // Mark OTP as used
+    await dynamo.send(new UpdateCommand({
+      TableName: 'OTPCodes', Key: { email },
+      UpdateExpression: 'set #u = :u',
+      ExpressionAttributeNames: { '#u': 'used' },
+      ExpressionAttributeValues: { ':u': true }
+    }));
+
+    // Update agent password if found
+    const landlord = await dynamo.send(new ScanCommand({
+      TableName: 'LandlordProfiles',
+      FilterExpression: 'email = :e',
+      ExpressionAttributeValues: { ':e': email }
+    }));
+    if (landlord.Items?.length) {
+      await dynamo.send(new UpdateCommand({
+        TableName: 'LandlordProfiles', Key: { landlordId: landlord.Items[0].landlordId },
+        UpdateExpression: 'set passwordHash = :p',
+        ExpressionAttributeValues: { ':p': hashPassword(newPassword) }
+      }));
+    }
+
+    // Update resident password if found
+    const tenant = await dynamo.send(new ScanCommand({
+      TableName: 'Tenants',
+      FilterExpression: 'email = :e',
+      ExpressionAttributeValues: { ':e': email }
+    }));
+    if (tenant.Items?.length) {
+      await dynamo.send(new UpdateCommand({
+        TableName: 'Tenants', Key: { tenantId: tenant.Items[0].tenantId },
+        UpdateExpression: 'set passwordHash = :p',
+        ExpressionAttributeValues: { ':p': hashPassword(newPassword) }
+      }));
+    }
+
+    res.json({ success: true, message: 'Password reset successfully!' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -273,6 +377,75 @@ app.get('/api/landlord/:id/apartments', async (req, res) => {
   }
 });
 
+// Update landlord profile
+app.patch('/api/landlord/:id/update', uploadSingle, async (req, res) => {
+  const { name, phone, whatsapp, bio, username } = req.body;
+  const { id: landlordId } = req.params;
+  try {
+    if (username) {
+      const check = await dynamo.send(new ScanCommand({
+        TableName: 'LandlordProfiles',
+        FilterExpression: 'username = :u AND landlordId <> :id',
+        ExpressionAttributeValues: { ':u': username.toLowerCase().trim(), ':id': landlordId }
+      }));
+      if (check.Items?.length > 0)
+        return res.status(400).json({ error: 'Username already taken' });
+    }
+    const profilePhotoUrl = req.file ? req.file.location : undefined;
+    const updateParts = ['#n=:n', 'phone=:p', 'whatsapp=:w', 'bio=:b'];
+    const exprValues = {
+      ':n': name || '', ':p': phone || '',
+      ':w': whatsapp || '', ':b': bio || ''
+    };
+    if (username) { updateParts.push('username=:u'); exprValues[':u'] = username.toLowerCase().trim(); }
+    if (profilePhotoUrl) { updateParts.push('profilePhotoUrl=:pp'); exprValues[':pp'] = profilePhotoUrl; }
+
+    await dynamo.send(new UpdateCommand({
+      TableName: 'LandlordProfiles', Key: { landlordId },
+      UpdateExpression: 'set ' + updateParts.join(', '),
+      ExpressionAttributeNames: { '#n': 'name' },
+      ExpressionAttributeValues: exprValues
+    }));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete landlord account + all their listings
+app.delete('/api/landlord/:id/account', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const { id: landlordId } = req.params;
+    const result = await dynamo.send(new GetCommand({
+      TableName: 'LandlordProfiles', Key: { landlordId }
+    }));
+    if (!result.Item) return res.status(404).json({ error: 'Account not found' });
+    if (result.Item.passwordHash !== hashPassword(password))
+      return res.status(403).json({ error: 'Incorrect password' });
+
+    // Delete all their listings
+    const listings = await dynamo.send(new ScanCommand({
+      TableName: 'Apartments',
+      FilterExpression: 'landlordId = :id',
+      ExpressionAttributeValues: { ':id': landlordId }
+    }));
+    for (const listing of listings.Items || []) {
+      await dynamo.send(new DeleteCommand({
+        TableName: 'Apartments', Key: { apartmentId: listing.apartmentId }
+      }));
+    }
+
+    // Delete the profile
+    await dynamo.send(new DeleteCommand({
+      TableName: 'LandlordProfiles', Key: { landlordId }
+    }));
+    res.json({ success: true, message: 'Account and all listings deleted.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* =========================
    TENANT AUTH ROUTES
 ========================= */
@@ -320,6 +493,26 @@ app.post('/api/tenant/login', async (req, res) => {
   }
 });
 
+// Delete resident account
+app.delete('/api/tenant/:id/account', async (req, res) => {
+  try {
+    const { password } = req.body;
+    const { id: tenantId } = req.params;
+    const result = await dynamo.send(new GetCommand({
+      TableName: 'Tenants', Key: { tenantId }
+    }));
+    if (!result.Item) return res.status(404).json({ error: 'Account not found' });
+    if (result.Item.passwordHash !== hashPassword(password))
+      return res.status(403).json({ error: 'Incorrect password' });
+    await dynamo.send(new DeleteCommand({
+      TableName: 'Tenants', Key: { tenantId }
+    }));
+    res.json({ success: true, message: 'Account deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* =========================
    APARTMENT ROUTES
 ========================= */
@@ -353,14 +546,14 @@ async function handleApartmentSave(req, res) {
 
     if (!title)    return res.status(400).json({ error: 'title is required.' });
     if (!location) return res.status(400).json({ error: 'location is required.' });
-   if (!rentValue || isNaN(Number(rentValue)) || Number(rentValue) <= 0)
+    if (!rentValue || isNaN(Number(rentValue)) || Number(rentValue) <= 0)
       return res.status(400).json({ error: 'Annual rent must be greater than zero.' });
     if (!bedrooms || isNaN(Number(bedrooms)))
       return res.status(400).json({ error: 'bedrooms is required and must be a number.' });
     if (!bathrooms || isNaN(Number(bathrooms)))
       return res.status(400).json({ error: 'bathrooms is required and must be a number.' });
 
-    // If landlordId provided, fetch their username to use as landlordName
+    // Fetch landlord username to use as landlordName
     let resolvedLandlordName = landlordName || 'Landlord';
     if (landlordId) {
       try {
@@ -370,9 +563,7 @@ async function handleApartmentSave(req, res) {
         if (landlordRecord.Item) {
           resolvedLandlordName = landlordRecord.Item.username || landlordRecord.Item.name || resolvedLandlordName;
         }
-      } catch (e) {
-        // fallback to provided name if lookup fails
-      }
+      } catch (e) { /* fallback */ }
     }
 
     const imageUrls = (req.files || []).map(f => f.location);
@@ -448,16 +639,16 @@ app.get('/api/apartments/:id', async (req, res) => {
   }
 });
 
-// Toggle availability (uses landlord login password as secret)
+// Toggle availability — verified by landlordId
 app.patch('/api/apartments/:id/availability', async (req, res) => {
   try {
-    const { available, landlordSecret } = req.body;
+    const { available, landlordId } = req.body;
     const result = await dynamo.send(
       new GetCommand({ TableName: 'Apartments', Key: { apartmentId: req.params.id } })
     );
     if (!result.Item) return res.status(404).json({ error: 'Apartment not found.' });
-    if (result.Item.landlordSecret && result.Item.landlordSecret !== landlordSecret)
-      return res.status(403).json({ error: 'Invalid password. Access denied.' });
+    if (result.Item.landlordId !== landlordId)
+      return res.status(403).json({ error: 'You do not own this listing.' });
     await dynamo.send(new UpdateCommand({
       TableName: 'Apartments',
       Key: { apartmentId: req.params.id },
@@ -470,16 +661,16 @@ app.patch('/api/apartments/:id/availability', async (req, res) => {
   }
 });
 
-// Delete listing (uses landlord login password as secret)
+// Delete listing — verified by landlordId
 app.delete('/api/apartments/:id', async (req, res) => {
   try {
-    const { landlordSecret } = req.body;
+    const { landlordId } = req.body;
     const result = await dynamo.send(
       new GetCommand({ TableName: 'Apartments', Key: { apartmentId: req.params.id } })
     );
     if (!result.Item) return res.status(404).json({ error: 'Apartment not found.' });
-    if (result.Item.landlordSecret && result.Item.landlordSecret !== landlordSecret)
-      return res.status(403).json({ error: 'Invalid password. Access denied.' });
+    if (result.Item.landlordId !== landlordId)
+      return res.status(403).json({ error: 'You do not own this listing.' });
     await dynamo.send(
       new DeleteCommand({ TableName: 'Apartments', Key: { apartmentId: req.params.id } })
     );
@@ -489,7 +680,7 @@ app.delete('/api/apartments/:id', async (req, res) => {
   }
 });
 
-// Edit listing (landlord must own it)
+// Edit listing — verified by landlordId
 app.patch('/api/apartments/:id/edit', async (req, res) => {
   try {
     const { landlordId, ...fields } = req.body;
@@ -593,7 +784,7 @@ app.post('/api/ai/recommend', async (req, res) => {
     const msg = await claude.messages.create({
       model: 'claude-sonnet-4-5-20251001',
       max_tokens: 1000,
-      messages: [{ role: 'user', content: `You are VacanSee AI for FUTA students in Akure. Budget: ₦${budget}/year, Zone: ${zone || 'anywhere near FUTA'}, Bedrooms: ${bedrooms}, Preferences: ${preferences || 'none'}.\n\nListings:\n${listingText}\n\nRecommend the best 3 options. Mention yearly pricing, ratings, and proximity to FUTA. Be friendly. For help, direct students to vacansee@gmail.com.` }]
+      messages: [{ role: 'user', content: `You are VacanSee AI for FUTA community in Akure. Budget: ₦${budget}/year, Zone: ${zone || 'anywhere near FUTA'}, Bedrooms: ${bedrooms}, Preferences: ${preferences || 'none'}.\n\nListings:\n${listingText}\n\nRecommend the best 3 options. Mention yearly pricing, ratings, and proximity to FUTA. Be friendly. For help, direct users to vacansee@gmail.com.` }]
     });
     res.json({ recommendation: msg.content[0].text });
   } catch (err) {
@@ -611,7 +802,7 @@ app.post('/api/ai/chat', async (req, res) => {
     const msg = await claude.messages.create({
       model: 'claude-sonnet-4-5-20251001',
       max_tokens: 500,
-      system: `You are VacanSee AI, a friendly housing assistant for FUTA (Federal University of Technology Akure) students. All prices are per year. For support, direct students to vacansee@gmail.com.\n\nAvailable listings:\n${listingText}`,
+      system: `You are VacanSee AI, a friendly housing assistant for FUTA (Federal University of Technology Akure) community. All prices are per year. For support, direct users to vacansee@gmail.com.\n\nAvailable listings:\n${listingText}`,
       messages: [...(history || []), { role: 'user', content: message }]
     });
     res.json({ reply: msg.content[0].text });
@@ -625,5 +816,5 @@ app.post('/api/ai/chat', async (req, res) => {
 ========================= */
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`✅ VacanSee V2 API running on http://localhost:${PORT}`);
+  console.log(`✅ VacanSee V3 API running on http://localhost:${PORT}`);
 });
