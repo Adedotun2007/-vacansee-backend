@@ -1060,6 +1060,17 @@ app.get('/api/auth/google/callback',
   }
 );
 
+
+app.get('/api/debug-env', (req, res) => {
+  res.json({
+    hasClientId: !!process.env.GOOGLE_CLIENT_ID,
+    hasClientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
+    hasCallbackUrl: !!process.env.GOOGLE_CALLBACK_URL,
+    callbackUrl: process.env.GOOGLE_CALLBACK_URL
+  });
+});
+
+
 /* =========================
    START SERVER
 ========================= */
@@ -1067,3 +1078,4 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ VacanSee V3 API running on http://localhost:${PORT}`);
 });
+
