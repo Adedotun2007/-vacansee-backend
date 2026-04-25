@@ -16,7 +16,7 @@ const {
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
-const { Resend } = require('resend'); // ← CHANGED from nodemailer
+const SibApiV3Sdk = require('sib-api-v3-sdk'); // Brevo
 
 const app = express();
 app.use(cors());
@@ -27,7 +27,10 @@ const dynamo = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION })
 );
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const resend = new Resend(process.env.RESEND_API_KEY); // ← CHANGED from nodemailer transporter
+// Brevo setup
+const brevoClient = SibApiV3Sdk.ApiClient.instance;
+brevoClient.authentications['api-key'].apiKey = process.env.BREVO_API_KEY;
+const brevoApi = new SibApiV3Sdk.TransactionalEmailsApi();
 
 /* =========================
    S3 upload middleware
@@ -267,6 +270,16 @@ app.post('/api/auth/send-otp', async (req, res) => {
   const { email, purpose } = req.body; // purpose: 'verify' | 'reset'
   if (!email) return res.status(400).json({ error: 'Email is required' });
   try {
+    // ✅ RATE LIMIT: block if OTP was sent less than 60 seconds ago
+    const existing = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
+    if (existing.Item && !existing.Item.used) {
+      const secondsAgo = (Date.now() - new Date(existing.Item.createdAt).getTime()) / 1000;
+      if (secondsAgo < 60) {
+        const waitSeconds = Math.ceil(60 - secondsAgo);
+        return res.status(429).json({ error: `Please wait ${waitSeconds} seconds before requesting another OTP.` });
+      }
+    }
+
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 mins
 
@@ -277,13 +290,13 @@ app.post('/api/auth/send-otp', async (req, res) => {
 
     const isReset = purpose === 'reset';
 
-    await resend.emails.send({
-      from: 'VacanSee <onboarding@resend.dev>', // ← change to noreply@vacansee.ng once you have domain
-      to: email,
+    await brevoApi.sendTransacEmail({
+      sender: { name: 'VacanSee', email: process.env.BREVO_SENDER_EMAIL },
+      to: [{ email }],
       subject: isReset
         ? 'VacanSee — Reset Your Password'
         : 'VacanSee — Verify Your Email',
-      html: buildOtpEmail(otp, purpose || 'verify')
+      htmlContent: buildOtpEmail(otp, purpose || 'verify')
     });
 
     res.json({ success: true, message: 'OTP sent!' });
@@ -302,7 +315,8 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     if (!record.Item) return res.status(400).json({ error: 'No OTP found. Request a new one.' });
     if (record.Item.used) return res.status(400).json({ error: 'OTP already used. Request a new one.' });
     if (new Date(record.Item.expiresAt) < new Date()) return res.status(400).json({ error: 'OTP expired. Request a new one.' });
-    if (record.Item.otp !== otp) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
+    // ✅ String cast to prevent type mismatch (frontend may send as number)
+    if (record.Item.otp !== String(otp).trim()) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
 
     // Mark OTP as used
     await dynamo.send(new UpdateCommand({
@@ -330,7 +344,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     if (!record.Item) return res.status(400).json({ error: 'No OTP found. Request a new one.' });
     if (record.Item.used) return res.status(400).json({ error: 'OTP already used. Request a new one.' });
     if (new Date(record.Item.expiresAt) < new Date()) return res.status(400).json({ error: 'OTP expired. Request a new one.' });
-    if (record.Item.otp !== otp) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
+    if (record.Item.otp !== String(otp).trim()) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
 
     // Mark OTP as used
     await dynamo.send(new UpdateCommand({
@@ -403,6 +417,11 @@ app.post('/api/landlord/signup', (req, res) => {
     if (err) return res.status(500).json({ error: 'Photo upload failed: ' + err.message });
     const { name, email, password, phone, whatsapp, bio, pin, username } = req.body;
     try {
+      // ✅ ENFORCE OTP VERIFICATION — email must be verified before signup
+      const otpRecord = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
+      if (!otpRecord.Item || !otpRecord.Item.used)
+        return res.status(403).json({ error: 'Email not verified. Please verify your OTP first.' });
+
       // Validate PIN
       const pinRecord = await dynamo.send(new GetCommand({ TableName: 'AdminPins', Key: { pin } }));
       if (!pinRecord.Item || pinRecord.Item.used || new Date(pinRecord.Item.expiresAt) < new Date())
@@ -592,6 +611,11 @@ app.delete('/api/landlord/:id/account', async (req, res) => {
 app.post('/api/tenant/signup', async (req, res) => {
   const { name, email, password, department, level } = req.body;
   try {
+    // ✅ ENFORCE OTP VERIFICATION — email must be verified before signup
+    const otpRecord = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
+    if (!otpRecord.Item || !otpRecord.Item.used)
+      return res.status(403).json({ error: 'Email not verified. Please verify your OTP first.' });
+
     const existing = await dynamo.send(new ScanCommand({
       TableName: 'Tenants',
       FilterExpression: 'email = :e',
