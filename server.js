@@ -280,6 +280,26 @@ app.post('/api/auth/send-otp', async (req, res) => {
       }
     }
 
+    // ✅ FOR PASSWORD RESET: block if email doesn't exist in either table
+    if (purpose === 'reset') {
+      const [agentResult, residentResult] = await Promise.all([
+        dynamo.send(new ScanCommand({
+          TableName: 'LandlordProfiles',
+          FilterExpression: 'email = :e',
+          ExpressionAttributeValues: { ':e': email }
+        })),
+        dynamo.send(new ScanCommand({
+          TableName: 'Tenants',
+          FilterExpression: 'email = :e',
+          ExpressionAttributeValues: { ':e': email }
+        }))
+      ]);
+      const agentExists = agentResult.Items && agentResult.Items.length > 0;
+      const residentExists = residentResult.Items && residentResult.Items.length > 0;
+      if (!agentExists && !residentExists)
+        return res.status(404).json({ error: 'No account found with this email address.' });
+    }
+
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 mins
 
