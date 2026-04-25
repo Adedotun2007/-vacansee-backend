@@ -1004,10 +1004,14 @@ app.post('/api/ai/chat', async (req, res) => {
    GOOGLE OAUTH
 ========================= */
 
+const googleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+console.log('Google Client Secret length:', googleClientSecret ? googleClientSecret.length : 'MISSING');
+
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID,
-  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-  callbackURL: process.env.GOOGLE_CALLBACK_URL
+  clientSecret: googleClientSecret,
+  callbackURL: process.env.GOOGLE_CALLBACK_URL,
+  passReqToCallback: false
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     const email = profile.emails[0].value;
@@ -1060,17 +1064,6 @@ app.get('/api/auth/google/callback',
   }
 );
 
-
-app.get('/api/debug-env', (req, res) => {
-  res.json({
-    hasClientId: !!process.env.GOOGLE_CLIENT_ID,
-    hasClientSecret: !!process.env.GOOGLE_CLIENT_SECRET,
-    hasCallbackUrl: !!process.env.GOOGLE_CALLBACK_URL,
-    callbackUrl: process.env.GOOGLE_CALLBACK_URL
-  });
-});
-
-
 /* =========================
    START SERVER
 ========================= */
@@ -1078,4 +1071,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ VacanSee V3 API running on http://localhost:${PORT}`);
 });
-
