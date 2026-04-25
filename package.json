@@ -19,9 +19,12 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-session": "^1.19.0",
     "multer": "^2.1.1",
     "multer-s3": "^3.0.1",
     "nodemailer": "^8.0.5",
+    "passport": "^0.7.0",
+    "passport-google-oauth20": "^2.0.0",
     "resend": "^6.12.2",
     "sib-api-v3-sdk": "^8.5.0",
     "uuid": "^13.0.0"

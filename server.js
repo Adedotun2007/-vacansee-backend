@@ -17,10 +17,16 @@ const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
 const SibApiV3Sdk = require('sib-api-v3-sdk'); // Brevo
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const session = require('express-session');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(session({ secret: 'vacansee_session_secret', resave: false, saveUninitialized: false }));
+app.use(passport.initialize());
+app.use(passport.session());
 
 const s3 = new S3Client({ region: process.env.AWS_REGION });
 const dynamo = DynamoDBDocumentClient.from(
@@ -993,6 +999,66 @@ app.post('/api/ai/chat', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/* =========================
+   GOOGLE OAUTH
+========================= */
+
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_CLIENT_ID,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  callbackURL: process.env.GOOGLE_CALLBACK_URL
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    const email = profile.emails[0].value;
+    const name = profile.displayName;
+
+    // Check if resident already exists
+    const existing = await dynamo.send(new ScanCommand({
+      TableName: 'Tenants',
+      FilterExpression: 'email = :e',
+      ExpressionAttributeValues: { ':e': email }
+    }));
+    if (existing.Items?.length) {
+      return done(null, existing.Items[0]);
+    }
+
+    // Create new resident from Google account
+    const tenantId = uuidv4();
+    const newTenant = {
+      tenantId, name, email,
+      passwordHash: '',
+      googleId: profile.id,
+      department: '', level: '',
+      createdAt: new Date().toISOString()
+    };
+    await dynamo.send(new PutCommand({ TableName: 'Tenants', Item: newTenant }));
+    done(null, newTenant);
+  } catch (err) { done(err, null); }
+}));
+
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((user, done) => done(null, user));
+
+// Redirect to Google login
+app.get('/api/auth/google',
+  passport.authenticate('google', { scope: ['profile', 'email'] })
+);
+
+// Google callback — redirects to frontend with user data
+app.get('/api/auth/google/callback',
+  passport.authenticate('google', { failureRedirect: `${process.env.FRONTEND_URL}/login?error=google_failed` }),
+  (req, res) => {
+    const user = req.user;
+    const params = new URLSearchParams({
+      tenantId: user.tenantId,
+      name: user.name,
+      email: user.email,
+      googleAuth: 'true'
+    });
+    res.redirect(`${process.env.FRONTEND_URL}/auth/success?${params}`);
+  }
+);
 
 /* =========================
    START SERVER
