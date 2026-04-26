@@ -41,22 +41,51 @@ const brevoApi = new SibApiV3Sdk.TransactionalEmailsApi();
 /* =========================
    S3 upload middleware
 ========================= */
+// Allowed MIME types — images and videos only, no other formats
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+const ALLOWED_VIDEO_TYPES = ['video/mp4', 'video/mov', 'video/quicktime', 'video/webm'];
+const ALLOWED_MEDIA_TYPES = [...ALLOWED_IMAGE_TYPES, ...ALLOWED_VIDEO_TYPES];
+
+function mediaFileFilter(req, file, cb) {
+  if (ALLOWED_MEDIA_TYPES.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(`File type not allowed: ${file.mimetype}. Only JPG, PNG, WEBP images and MP4, MOV, WEBM videos are accepted.`), false);
+  }
+}
+
+function imageOnlyFilter(req, file, cb) {
+  if (ALLOWED_IMAGE_TYPES.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error(`File type not allowed: ${file.mimetype}. Only JPG, PNG, WEBP images are accepted for profile photos.`), false);
+  }
+}
+
+// Listing media: images + videos, max 10 files, max 100MB each
 const uploadMiddleware = multer({
   storage: multerS3({
     s3,
     bucket: process.env.S3_BUCKET,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
     key: (req, file, cb) =>
-      cb(null, `vacansee/${uuidv4()}-${file.originalname}`)
-  })
+      cb(null, `vacansee/${uuidv4()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
+  }),
+  fileFilter: mediaFileFilter,
+  limits: { fileSize: 100 * 1024 * 1024 }
 }).array('photos', 10);
 
+// Profile photo: images only, single file, max 5MB
 const uploadSingle = multer({
   storage: multerS3({
     s3,
     bucket: process.env.S3_BUCKET,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
     key: (req, file, cb) =>
-      cb(null, `vacansee/profiles/${uuidv4()}-${file.originalname}`)
-  })
+      cb(null, `vacansee/profiles/${uuidv4()}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_')}`)
+  }),
+  fileFilter: imageOnlyFilter,
+  limits: { fileSize: 5 * 1024 * 1024 }
 }).single('profilePhoto');
 
 /* =========================
@@ -635,7 +664,7 @@ app.delete('/api/landlord/:id/account', async (req, res) => {
 ========================= */
 
 app.post('/api/tenant/signup', async (req, res) => {
-  const { name, email, password, department, level } = req.body;
+  const { name, email, password, userType, department, level } = req.body;
   try {
     // ✅ ENFORCE OTP VERIFICATION — email must be verified before signup
     const otpRecord = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
@@ -649,17 +678,25 @@ app.post('/api/tenant/signup', async (req, res) => {
     }));
     if (existing.Items && existing.Items.length > 0)
       return res.status(400).json({ error: 'Account already exists with this email' });
+
+    // userType: 'student' | 'staff' | 'other'
+    // department is only required/saved when userType is 'student'
+    const resolvedUserType = userType || 'student';
+    const isStudent = resolvedUserType === 'student';
+
     const tenantId = uuidv4();
     await dynamo.send(new PutCommand({
       TableName: 'Tenants',
       Item: {
         tenantId, name, email,
         passwordHash: hashPassword(password),
-        department: department || '', level: level || '',
+        userType: resolvedUserType,
+        department: isStudent ? (department || '') : '',
+        level: isStudent ? (level || '') : '',
         createdAt: new Date().toISOString()
       }
     }));
-    res.json({ success: true, tenantId, name, email });
+    res.json({ success: true, tenantId, name, email, userType: resolvedUserType });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -971,7 +1008,7 @@ app.post('/api/ai/recommend', async (req, res) => {
       `ID: ${a.apartmentId} | ${a.title} | ${a.location} (${a.zone}) | Yearly: ₦${a.yearlyRent?.toLocaleString()} | Total: ₦${a.totalPackage?.toLocaleString()} | ${a.bedrooms} bed | Rating: ${a.averageRating}/5 | Amenities: ${a.amenities?.join(', ')}`
     ).join('\n');
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1000,
       messages: [{ role: 'user', content: `You are VacanSee AI for FUTA community in Akure. Budget: ₦${budget}/year, Zone: ${zone || 'anywhere near FUTA'}, Bedrooms: ${bedrooms}, Preferences: ${preferences || 'none'}.\n\nListings:\n${listingText}\n\nRecommend the best 3 options. Mention yearly pricing, ratings, and proximity to FUTA. Be friendly. For help, direct users to vacansee@gmail.com.` }]
     });
@@ -989,7 +1026,7 @@ app.post('/api/ai/chat', async (req, res) => {
       `${a.title} at ${a.location} — ₦${a.yearlyRent?.toLocaleString()}/year, total ₦${a.totalPackage?.toLocaleString()}, ${a.bedrooms} bed, WhatsApp: ${a.whatsapp}`
     ).join('\n');
     const msg = await claude.messages.create({
-      model: 'claude-sonnet-4-5-20251001',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 500,
       system: `You are VacanSee AI, a friendly housing assistant for FUTA (Federal University of Technology Akure) community. All prices are per year. For support, direct users to vacansee@gmail.com.\n\nAvailable listings:\n${listingText}`,
       messages: [...(history || []), { role: 'user', content: message }]
