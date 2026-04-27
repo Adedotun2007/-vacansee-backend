@@ -16,7 +16,7 @@ const {
 const { v4: uuidv4 } = require('uuid');
 const Anthropic = require('@anthropic-ai/sdk');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend'); // ← CHANGED from nodemailer
 
 const app = express();
 app.use(cors());
@@ -27,15 +27,7 @@ const dynamo = DynamoDBDocumentClient.from(
   new DynamoDBClient({ region: process.env.AWS_REGION })
 );
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// Gmail transporter for OTP emails
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
-  }
-});
+const resend = new Resend(process.env.RESEND_API_KEY); // ← CHANGED from nodemailer transporter
 
 /* =========================
    S3 upload middleware
@@ -76,6 +68,131 @@ function generatePIN() {
 function hashPassword(password) {
   return crypto.createHash('sha256')
     .update(password + 'vacansee_salt_2025').digest('hex');
+}
+
+/* =========================
+   Email HTML Builder
+========================= */
+function buildOtpEmail(otp, purpose = 'verify') {
+  const isReset = purpose === 'reset';
+  const headline = isReset ? 'Password Reset' : 'Verify Your Email';
+  const subtext = isReset
+    ? 'You requested a password reset for your VacanSee account.'
+    : 'Welcome to VacanSee! Use the code below to verify your email and complete signup.';
+  const footerNote = isReset
+    ? 'If you did not request a password reset, you can safely ignore this email.'
+    : 'If you did not sign up for VacanSee, you can safely ignore this email.';
+
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VacanSee — ${headline}</title>
+</head>
+<body style="margin:0;padding:0;background:#0a0f0a;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <!-- Outer wrapper -->
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0f0a;padding:40px 16px;">
+    <tr>
+      <td align="center">
+
+        <!-- Card -->
+        <table width="520" cellpadding="0" cellspacing="0" style="max-width:520px;width:100%;background:#0f1a12;border-radius:20px;border:1px solid #1e3a23;overflow:hidden;">
+
+          <!-- Top accent bar -->
+          <tr>
+            <td style="background:linear-gradient(90deg,#00c87a,#00a060,#007a45);height:4px;"></td>
+          </tr>
+
+          <!-- Header -->
+          <tr>
+            <td style="padding:36px 40px 0;text-align:center;">
+              <!-- Logo mark -->
+              <div style="display:inline-block;background:linear-gradient(135deg,#00c87a22,#00c87a11);border:1px solid #00c87a44;border-radius:16px;padding:12px 20px;margin-bottom:20px;">
+                <span style="font-size:22px;font-weight:900;letter-spacing:-0.5px;color:#00c87a;">Vacan<span style="color:#ffffff;">See</span></span>
+                <span style="display:block;font-size:10px;color:#4a7a55;letter-spacing:3px;text-transform:uppercase;margin-top:2px;">FUTA Housing</span>
+              </div>
+
+              <!-- Headline -->
+              <h1 style="margin:0 0 10px;font-size:24px;font-weight:800;color:#ffffff;letter-spacing:-0.3px;">${headline}</h1>
+              <p style="margin:0;font-size:14px;color:#6a9a75;line-height:1.6;max-width:380px;margin:0 auto;">${subtext}</p>
+            </td>
+          </tr>
+
+          <!-- OTP Box -->
+          <tr>
+            <td style="padding:32px 40px;">
+              <div style="background:#071209;border:2px solid #00c87a33;border-radius:16px;padding:28px 20px;text-align:center;position:relative;">
+                <!-- Subtle label -->
+                <p style="margin:0 0 12px;font-size:11px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:#3a6a45;">Your Code</p>
+                <!-- OTP digits -->
+                <div style="display:inline-flex;gap:8px;justify-content:center;">
+                  ${otp.split('').map(digit => `
+                  <span style="
+                    display:inline-block;
+                    width:44px;height:56px;line-height:56px;
+                    background:#0f1a12;
+                    border:1px solid #00c87a55;
+                    border-radius:10px;
+                    font-size:28px;font-weight:900;
+                    color:#00c87a;
+                    text-align:center;
+                    font-family:'Courier New',monospace;
+                  ">${digit}</span>`).join('')}
+                </div>
+                <!-- Expiry note -->
+                <p style="margin:16px 0 0;font-size:12px;color:#3a6a45;">
+                  ⏱ Expires in <strong style="color:#00c87a;">10 minutes</strong>
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Info section -->
+          <tr>
+            <td style="padding:0 40px 20px;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="background:#071209;border:1px solid #1e3a23;border-radius:12px;padding:16px 18px;">
+                    <p style="margin:0;font-size:12px;color:#4a7a55;line-height:1.7;">
+                      🔒 <strong style="color:#6aaa80;">Never share this code</strong> with anyone — VacanSee staff will never ask for it.<br/>
+                      📧 Having trouble? Email us at <a href="mailto:vacansee@gmail.com" style="color:#00c87a;text-decoration:none;">vacansee@gmail.com</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Divider -->
+          <tr>
+            <td style="padding:0 40px;">
+              <div style="height:1px;background:#1e3a23;"></div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:20px 40px 32px;text-align:center;">
+              <p style="margin:0 0 6px;font-size:11px;color:#2a4a33;">${footerNote}</p>
+              <p style="margin:0;font-size:11px;color:#2a4a33;">
+                © 2025 VacanSee · FUTA Community Housing · Akure, Nigeria
+              </p>
+            </td>
+          </tr>
+
+        </table>
+        <!-- End card -->
+
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>
+  `.trim();
 }
 
 /* =========================
@@ -147,39 +264,61 @@ app.post('/api/validate-pin', async (req, res) => {
 
 // Send OTP — for signup verification AND password reset
 app.post('/api/auth/send-otp', async (req, res) => {
-  const { email } = req.body;
+  const { email, purpose } = req.body; // purpose: 'verify' | 'reset'
   if (!email) return res.status(400).json({ error: 'Email is required' });
   try {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 mins
+
     await dynamo.send(new PutCommand({
       TableName: 'OTPCodes',
       Item: { email, otp, expiresAt, used: false, createdAt: new Date().toISOString() }
     }));
-    await transporter.sendMail({
-      from: `"VacanSee" <${process.env.GMAIL_USER}>`,
+
+    const isReset = purpose === 'reset';
+
+    await resend.emails.send({
+      from: 'VacanSee <onboarding@resend.dev>', // ← change to noreply@vacansee.ng once you have domain
       to: email,
-      subject: 'VacanSee — Your Verification Code',
-      html: `
-        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f5f5f5;border-radius:16px">
-          <h2 style="color:#1a5c35;margin-bottom:8px">VacanSee Verification</h2>
-          <p style="color:#555;margin-bottom:20px">Your verification code — expires in 10 minutes:</p>
-          <div style="background:#fff;border-radius:12px;padding:24px;text-align:center;border:2px solid #2d9e5f;margin-bottom:20px">
-            <p style="font-size:40px;font-weight:900;letter-spacing:12px;color:#1a5c35;margin:0">${otp}</p>
-          </div>
-          <p style="color:#888;font-size:12px">If you didn't request this, ignore this email.</p>
-          <p style="color:#888;font-size:12px">— VacanSee · vacansee@gmail.com</p>
-        </div>
-      `
+      subject: isReset
+        ? 'VacanSee — Reset Your Password'
+        : 'VacanSee — Verify Your Email',
+      html: buildOtpEmail(otp, purpose || 'verify')
     });
+
     res.json({ success: true, message: 'OTP sent!' });
   } catch (err) {
     console.error('OTP send error:', err);
-    res.status(500).json({ error: 'Failed to send OTP. Check Gmail credentials in Railway Variables.' });
+    res.status(500).json({ error: 'Failed to send OTP: ' + err.message });
   }
 });
 
-// Verify OTP and reset password
+// Verify OTP only (for signup flow — just checks OTP, doesn't reset password)
+app.post('/api/auth/verify-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ error: 'Email and OTP are required' });
+  try {
+    const record = await dynamo.send(new GetCommand({ TableName: 'OTPCodes', Key: { email } }));
+    if (!record.Item) return res.status(400).json({ error: 'No OTP found. Request a new one.' });
+    if (record.Item.used) return res.status(400).json({ error: 'OTP already used. Request a new one.' });
+    if (new Date(record.Item.expiresAt) < new Date()) return res.status(400).json({ error: 'OTP expired. Request a new one.' });
+    if (record.Item.otp !== otp) return res.status(400).json({ error: 'Incorrect OTP. Check your email.' });
+
+    // Mark OTP as used
+    await dynamo.send(new UpdateCommand({
+      TableName: 'OTPCodes', Key: { email },
+      UpdateExpression: 'set #u = :u',
+      ExpressionAttributeNames: { '#u': 'used' },
+      ExpressionAttributeValues: { ':u': true }
+    }));
+
+    res.json({ success: true, message: 'Email verified!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verify OTP and reset password (for forgot password flow)
 app.post('/api/auth/reset-password', async (req, res) => {
   const { email, otp, newPassword } = req.body;
   if (!email || !otp || !newPassword)
